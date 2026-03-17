@@ -1,0 +1,390 @@
+!pip install GraphRicciCurvature networkx numpy pandas matplotlib seaborn scipy
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+from GraphRicciCurvature.OllivierRicci import OllivierRicci
+
+
+# ============================================================
+# 0. GLOBAL SETTINGS
+# ============================================================
+np.random.seed(42)
+plt.style.use("seaborn-v0_8-whitegrid")
+
+# Synthetic economy parameters
+N = 50                 # number of economic nodes
+T_total = 400          # total time points
+window_size = 100      # rolling window length
+step_size = 5          # rolling step
+Q = window_size / N    # MP ratio, must satisfy Q >= 1
+
+# Crisis interval
+crisis_start = 150
+crisis_end = 250
+
+# Snapshot times for visualization
+stable_snapshot_t = 120
+crisis_snapshot_t = 220
+
+# Detection thresholds
+beta = 1.20            # spectral amplification factor
+kappa_c = -0.05        # critical curvature threshold (can be tuned)
+
+
+# ============================================================
+# 1. SYNTHETIC DATA GENERATION
+# ============================================================
+def generate_synthetic_returns(
+    N: int,
+    T_total: int,
+    crisis_start: int,
+    crisis_end: int,
+    seed: int = 42
+) -> np.ndarray:
+    """
+    Generate synthetic macro-financial return series with a crisis regime
+    that induces synchronization across nodes.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Baseline idiosyncratic noise
+    returns = rng.normal(0.0, 1.0, size=(N, T_total))
+
+    # Common crisis factor
+    crisis_factor = rng.normal(0.0, 3.0, size=T_total)
+
+    # Node-specific loading on crisis factor
+    loadings = rng.uniform(0.5, 1.5, size=N)
+
+    for i in range(N):
+        returns[i, crisis_start:crisis_end] += (
+            loadings[i] * crisis_factor[crisis_start:crisis_end]
+        )
+
+    return returns
+
+
+# ============================================================
+# 2. HELPER FUNCTIONS
+# ============================================================
+def standardize_window(X: np.ndarray) -> np.ndarray:
+    """
+    Standardize each row of X within the rolling window.
+    """
+    mean = X.mean(axis=1, keepdims=True)
+    std = X.std(axis=1, keepdims=True, ddof=1)
+    std = np.where(std < 1e-12, 1.0, std)
+    return (X - mean) / std
+
+
+def compute_correlation_matrix(X_window: np.ndarray) -> np.ndarray:
+    """
+    Compute a numerically stable correlation matrix.
+    """
+    C = np.corrcoef(X_window)
+    C = np.nan_to_num(C, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Numerical clipping to preserve valid correlation range
+    C = np.clip(C, -1.0, 1.0)
+
+    # Force exact symmetry and unit diagonal
+    C = 0.5 * (C + C.T)
+    np.fill_diagonal(C, 1.0)
+    return C
+
+
+def correlation_to_distance(C: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    """
+    Transform correlation matrix into a valid Euclidean distance matrix:
+        d_ij = sqrt(2(1 - C_ij))
+    """
+    D = np.sqrt(np.maximum(2.0 * (1.0 - C), 0.0))
+    D = D + eps
+    np.fill_diagonal(D, 0.0)
+    return D
+
+
+def build_mst_graph(D: np.ndarray) -> nx.Graph:
+    """
+    Build a Minimum Spanning Tree from the distance matrix.
+    """
+    G_full = nx.from_numpy_array(D)
+    G_mst = nx.minimum_spanning_tree(G_full, weight="weight")
+    return G_mst
+
+
+def compute_average_ricci_curvature(G: nx.Graph, alpha: float = 0.5) -> float:
+    """
+    Compute average Ollivier-Ricci curvature on the graph.
+    """
+    orc = OllivierRicci(G, alpha=alpha, verbose="ERROR")
+    orc.compute_ricci_curvature()
+
+    curvatures = []
+    for u, v in orc.G.edges():
+        kappa_uv = orc.G[u][v].get("ricciCurvature", np.nan)
+        curvatures.append(kappa_uv)
+
+    return float(np.nanmean(curvatures))
+
+
+def compute_largest_eigenvalue(C: np.ndarray) -> float:
+    """
+    Compute largest eigenvalue of the correlation matrix.
+    """
+    eigenvalues = np.linalg.eigvalsh(C)
+    return float(np.max(eigenvalues))
+
+
+def compute_mp_upper_bound(Q: float) -> float:
+    """
+    Marchenko-Pastur upper edge:
+        lambda_+ = (1 + sqrt(1/Q))^2
+    """
+    return (1.0 + np.sqrt(1.0 / Q)) ** 2
+
+
+def classify_instability(
+    lambda_1: float,
+    lambda_plus: float,
+    avg_kappa: float,
+    beta: float,
+    kappa_c: float
+) -> bool:
+    """
+    Joint instability criterion:
+        lambda_1 > beta * lambda_plus
+        avg_kappa <= kappa_c
+    """
+    return (lambda_1 > beta * lambda_plus) and (avg_kappa <= kappa_c)
+
+
+# ============================================================
+# 3. ROLLING ANALYSIS
+# ============================================================
+returns = generate_synthetic_returns(
+    N=N,
+    T_total=T_total,
+    crisis_start=crisis_start,
+    crisis_end=crisis_end,
+    seed=42
+)
+
+times = list(range(window_size, T_total, step_size))
+lambda_plus = compute_mp_upper_bound(Q)
+
+lambda_1_list = []
+curvature_list = []
+instability_flags = []
+
+snap_stable = None
+snap_crisis = None
+
+print("Computing rolling geometric-spectral diagnostics...")
+
+for t in times:
+    X_t_raw = returns[:, t - window_size:t]
+    X_t = standardize_window(X_t_raw)
+
+    C_t = compute_correlation_matrix(X_t)
+    D_t = correlation_to_distance(C_t)
+    G_t = build_mst_graph(D_t)
+
+    l1_t = compute_largest_eigenvalue(C_t)
+    kappa_t = compute_average_ricci_curvature(G_t, alpha=0.5)
+
+    lambda_1_list.append(l1_t)
+    curvature_list.append(kappa_t)
+    instability_flags.append(
+        classify_instability(
+            lambda_1=l1_t,
+            lambda_plus=lambda_plus,
+            avg_kappa=kappa_t,
+            beta=beta,
+            kappa_c=kappa_c
+        )
+    )
+
+    if t == stable_snapshot_t:
+        snap_stable = (C_t.copy(), D_t.copy(), G_t.copy())
+    if t == crisis_snapshot_t:
+        snap_crisis = (C_t.copy(), D_t.copy(), G_t.copy())
+
+results_df = pd.DataFrame({
+    "time": times,
+    "lambda_1": lambda_1_list,
+    "avg_curvature": curvature_list,
+    "instability": instability_flags
+})
+
+print(results_df.head())
+
+
+# ============================================================
+# 4. FIGURE 1: TRANSFORMATION PIPELINE
+# ============================================================
+fig1, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+im0 = axes[0].imshow(snap_stable[0], aspect="auto", cmap="coolwarm", vmin=-1, vmax=1)
+axes[0].set_title("A. Cross-Correlation Matrix $C(t)$")
+axes[0].set_xlabel("Node index")
+axes[0].set_ylabel("Node index")
+fig1.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+im1 = axes[1].imshow(snap_stable[1], aspect="auto", cmap="viridis")
+axes[1].set_title("B. Distance Matrix $D(t)$")
+axes[1].set_xlabel("Node index")
+axes[1].set_ylabel("Node index")
+fig1.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+pos1 = nx.spring_layout(snap_stable[2], seed=42)
+nx.draw(
+    snap_stable[2],
+    pos=pos1,
+    ax=axes[2],
+    node_size=50,
+    edge_color="gray",
+    with_labels=False
+)
+axes[2].set_title("C. Filtered Interaction Graph (MST)")
+
+fig1.suptitle("Figure 1. Macroeconomic Network Transformation Pipeline", fontsize=15)
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 5. FIGURE 2: SPECTRAL EXPLOSION
+# ============================================================
+plt.figure(figsize=(10, 5))
+plt.plot(results_df["time"], results_df["lambda_1"], linewidth=2, label="Largest eigenvalue $\\lambda_1(t)$")
+plt.axhline(
+    y=lambda_plus,
+    linestyle="--",
+    linewidth=1.8,
+    label=f"Marchenko-Pastur bound $\\lambda_+ = {lambda_plus:.2f}$"
+)
+plt.axhline(
+    y=beta * lambda_plus,
+    linestyle=":",
+    linewidth=1.8,
+    label=f"Instability threshold $\\beta\\lambda_+ = {beta * lambda_plus:.2f}$"
+)
+plt.axvspan(crisis_start, crisis_end, alpha=0.12, label="Injected crisis regime")
+plt.title("Figure 2. Spectral Explosion of the Dominant Market Mode")
+plt.xlabel("Time $t$")
+plt.ylabel("Largest eigenvalue")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 6. FIGURE 3: GEOMETRIC CONTRACTION
+# ============================================================
+plt.figure(figsize=(10, 5))
+plt.plot(results_df["time"], results_df["avg_curvature"], linewidth=2, label="Average Ricci curvature $\\langle \\kappa \\rangle(t)$")
+plt.axhline(
+    y=kappa_c,
+    linestyle="--",
+    linewidth=1.8,
+    label=f"Critical curvature $\\kappa_c = {kappa_c:.2f}$"
+)
+plt.axvspan(crisis_start, crisis_end, alpha=0.12, label="Injected crisis regime")
+plt.title("Figure 3. Geometric Contraction of the Macroeconomic Network")
+plt.xlabel("Time $t$")
+plt.ylabel("Average Ollivier-Ricci curvature")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 7. FIGURE 4: GEOMETRIC-SPECTRAL PHASE DIAGRAM
+# ============================================================
+plt.figure(figsize=(8, 6))
+sc = plt.scatter(
+    results_df["avg_curvature"],
+    results_df["lambda_1"],
+    c=results_df["time"],
+    cmap="viridis",
+    alpha=0.85,
+    edgecolors="k",
+    s=60
+)
+
+plt.axhline(
+    y=beta * lambda_plus,
+    linestyle="--",
+    linewidth=1.5,
+    label="$\\beta\\lambda_+$ threshold"
+)
+plt.axvline(
+    x=kappa_c,
+    linestyle="--",
+    linewidth=1.5,
+    label="$\\kappa_c$ threshold"
+)
+
+# Highlight instability quadrant
+x_min, x_max = plt.xlim()
+y_min, y_max = plt.ylim()
+plt.fill_betweenx(
+    [beta * lambda_plus, y_max],
+    x_min,
+    kappa_c,
+    alpha=0.08
+)
+
+plt.title("Figure 4. Geometric-Spectral Phase Diagram")
+plt.xlabel("Average curvature $\\langle \\kappa \\rangle$")
+plt.ylabel("Largest eigenvalue $\\lambda_1$")
+cbar = plt.colorbar(sc)
+cbar.set_label("Time progression")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 8. FIGURE 5: TOPOLOGICAL DEFORMATION
+# ============================================================
+fig5, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+pos_stable = nx.spring_layout(snap_stable[2], seed=42)
+pos_crisis = nx.spring_layout(snap_crisis[2], seed=42)
+
+nx.draw(
+    snap_stable[2],
+    pos=pos_stable,
+    ax=axes[0],
+    node_size=80,
+    edge_color="gray",
+    with_labels=False
+)
+axes[0].set_title("A. Stable Regime")
+
+nx.draw(
+    snap_crisis[2],
+    pos=pos_crisis,
+    ax=axes[1],
+    node_size=80,
+    edge_color="black",
+    with_labels=False
+)
+axes[1].set_title("B. Crisis Regime")
+
+fig5.suptitle("Figure 5. Topological Deformation During Systemic Stress", fontsize=15)
+plt.tight_layout()
+plt.show()
+
+
+# ============================================================
+# 9. OPTIONAL: EXPORT RESULTS
+# ============================================================
+results_df.to_csv("geometric_spectral_results.csv", index=False)
+print("Saved rolling results to geometric_spectral_results.csv")
