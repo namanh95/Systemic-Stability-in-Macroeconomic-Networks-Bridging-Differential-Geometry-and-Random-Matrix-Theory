@@ -250,7 +250,7 @@ nx.draw(
     edge_color="gray",
     with_labels=False
 )
-axes[2].set_title("C. Filtered Interaction Graph (MST)")
+axes[2].set_title("C. Planar Maximally Filtered Graph (PMFG)")
 
 fig1.suptitle("Figure 1. Macroeconomic Network Transformation Pipeline", fontsize=15)
 plt.tight_layout()
